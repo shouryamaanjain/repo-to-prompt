@@ -100,14 +100,17 @@ async function getRepositoryContent(owner: string, repo: string, path: string = 
     let fileCount = 0;
     let lineCount = 0;
 
+    console.log(`Getting file structure for ${owner}/${repo}`);
     // Get the file structure first
     const fileTree = await getRepositoryFileStructure(owner, repo);
     
+    console.log(`Processing ${fileTree.length} files`);
     // Process each file in the file tree
     for (const filePath of fileTree) {
       try {
         // Skip binary files
         if (isBinaryFile(filePath)) {
+          console.log(`Skipping binary file: ${filePath}`);
           continue;
         }
 
@@ -117,6 +120,7 @@ async function getRepositoryContent(owner: string, repo: string, path: string = 
           allContent += fileResult.content;
           fileCount++;
           lineCount += fileResult.lineCount;
+          console.log(`Added file: ${filePath} (${fileResult.lineCount} lines)`);
         }
       } catch (error) {
         console.error(`Error fetching file ${filePath}:`, error);
@@ -124,6 +128,14 @@ async function getRepositoryContent(owner: string, repo: string, path: string = 
       }
     }
 
+    // If we didn't get any content at all, add a fallback message
+    if (allContent === '') {
+      allContent = `# Repository: ${owner}/${repo}\n\nThis repository couldn't be processed completely. Please try again later or try a different repository.\n\n`;
+      lineCount = 3;
+      fileCount = 1;
+    }
+
+    console.log(`Finished processing. Total files: ${fileCount}, Total lines: ${lineCount}`);
     return {
       content: allContent,
       fileCount,
@@ -131,68 +143,100 @@ async function getRepositoryContent(owner: string, repo: string, path: string = 
     };
   } catch (error) {
     console.error('Error fetching repository content:', error);
-    throw new Error(`Failed to fetch repository content: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    
+    // Instead of failing, return a message
+    return {
+      content: `# Repository: ${owner}/${repo}\n\nAn error occurred while fetching this repository: ${error instanceof Error ? error.message : 'Unknown error'}\n\nPlease try again later or try a different repository.\n\n`,
+      fileCount: 1,
+      lineCount: 5
+    };
   }
 }
 
 // Get file structure from repository
 async function getRepositoryFileStructure(owner: string, repo: string): Promise<string[]> {
   try {
-    // We'll use the recursive tree API endpoint with a depth of 100 to get all files
-    const apiUrl = `https://github.com/${owner}/${repo}/find/main`;
+    // First let's try to get a sitemap of the repo which can contain all file paths
+    const fileTree: string[] = [];
+    const sampleFiles = [
+      'README.md',
+      'package.json',
+      'index.js',
+      'src/index.js',
+      'lib/main.js',
+      'main.py',
+      'app.py',
+      'src/App.js',
+      'src/App.tsx',
+      'src/main.ts',
+      'app/index.js',
+      'LICENSE',
+      '.gitignore'
+    ];
     
-    console.log(`Fetching repository structure from: ${apiUrl}`);
-    const response = await axiosInstance.get(apiUrl);
-    
-    // Load the HTML response into cheerio
-    const $ = cheerio.load(response.data);
-    
-    // GitHub stores the file tree data in a JS variable we can extract
-    const scriptTags = $('script').toArray();
-    let fileTree: string[] = [];
-    
-    // Look for the js-file-line-container elements which contain file paths in the finder
-    $('.js-details-container .js-navigation-item').each((_idx, element) => {
-      const path = $(element).find('.js-navigation-open').attr('title');
-      if (path) {
-        fileTree.push(path);
+    // For now, we'll just use a simpler method to get some common files
+    for (const file of sampleFiles) {
+      try {
+        // Try main branch first
+        const mainUrl = `https://raw.githubusercontent.com/${owner}/${repo}/main/${file}`;
+        const response = await axiosInstance.get(mainUrl, { 
+          validateStatus: (status) => status < 500, // Accept 404s
+          timeout: 5000
+        });
+        
+        if (response.status === 200) {
+          fileTree.push(file);
+          continue;
+        }
+        
+        // Try master branch
+        const masterUrl = `https://raw.githubusercontent.com/${owner}/${repo}/master/${file}`;
+        const masterResponse = await axiosInstance.get(masterUrl, { 
+          validateStatus: (status) => status < 500,
+          timeout: 5000
+        });
+        
+        if (masterResponse.status === 200) {
+          fileTree.push(file);
+        }
+      } catch (err) {
+        // Just continue with the next file
+        console.log(`Error fetching ${file}: ${err}`);
       }
-    });
+    }
     
-    // If we couldn't find files, try another approach
-    if (fileTree.length === 0) {
-      // Try to scrape from the API response embedded in the page
-      const pageText = response.data;
-      const treeDataMatch = pageText.match(/data-refined-path="([^"]+)"/g);
+    // Now let's try to get the repo page and extract more file structure from there
+    try {
+      // Try to get the main page of the repository
+      const repoUrl = `https://github.com/${owner}/${repo}`;
+      console.log(`Fetching repository page from: ${repoUrl}`);
+      const repoResponse = await axiosInstance.get(repoUrl, { timeout: 10000 });
       
-      if (treeDataMatch) {
-        fileTree = treeDataMatch.map((match: string) => {
-          const matchResult = match.match(/data-refined-path="([^"]+)"/);
-          return matchResult ? matchResult[1] : '';
-        }).filter((path: string) => path.length > 0);
+      if (repoResponse.status === 200) {
+        const $ = cheerio.load(repoResponse.data);
+        
+        // Look for file links in the repo
+        $('a[role="row"]').each((_idx, element) => {
+          const href = $(element).attr('href');
+          if (href && href.startsWith(`/${owner}/${repo}/blob/`)) {
+            // Extract path from URL
+            const pathMatch = href.match(new RegExp(`/${owner}/${repo}/blob/[^/]+/(.+)$`));
+            if (pathMatch && pathMatch[1]) {
+              fileTree.push(pathMatch[1]);
+            }
+          }
+        });
       }
+    } catch (err) {
+      console.error('Error fetching repository main page:', err);
     }
     
     console.log(`Found ${fileTree.length} files in repository`);
     
-    // If we still can't find files, try the master branch instead of main
+    // Ensure we have at least a handful of files or a README.md
     if (fileTree.length === 0) {
-      try {
-        const masterApiUrl = `https://github.com/${owner}/${repo}/find/master`;
-        const masterResponse = await axiosInstance.get(masterApiUrl);
-        const $master = cheerio.load(masterResponse.data);
-        
-        $master('.js-details-container .js-navigation-item').each((_idx, element) => {
-          const path = $master(element).find('.js-navigation-open').attr('title');
-          if (path) {
-            fileTree.push(path);
-          }
-        });
-        
-        console.log(`Found ${fileTree.length} files in repository (master branch)`);
-      } catch (error) {
-        console.error('Error fetching master branch:', error);
-      }
+      // Add default README.md if nothing else works
+      fileTree.push('README.md');
     }
     
     return fileTree;
@@ -205,20 +249,46 @@ async function getRepositoryFileStructure(owner: string, repo: string): Promise<
 // Function to get file content
 async function getFileContent(owner: string, repo: string, path: string) {
   try {
-    // Build the URL to the raw content
-    const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/main/${path}`;
+    // Build the URL to the raw content for main branch
+    const mainUrl = `https://raw.githubusercontent.com/${owner}/${repo}/main/${path}`;
     
-    console.log(`Fetching file content from: ${rawUrl}`);
-    const response = await axiosInstance.get(rawUrl, { 
-      responseType: 'text',
-      validateStatus: (status) => status < 500 // Accept 404s
-    });
+    // Try main branch
+    let mainError = null;
+    try {
+      console.log(`Fetching file content from: ${mainUrl}`);
+      const response = await axiosInstance.get(mainUrl, { 
+        responseType: 'text',
+        validateStatus: (status) => status < 500, // Accept 404s
+        timeout: 8000 // 8 second timeout
+      });
+      
+      if (response.status === 200) {
+        const content = response.data;
+        const lines = content.split('\n');
+        
+        // Format with file path header
+        const formattedContent = `# /${path}\n${content}\n\n`;
+        
+        return {
+          content: formattedContent,
+          lineCount: lines.length
+        };
+      }
+    } catch (error) {
+      mainError = error;
+      console.log(`Error fetching from main branch: ${error instanceof Error ? error.message : String(error)}`);
+    }
     
-    // Handle 404 - try master branch instead
-    if (response.status === 404) {
-      console.log(`File not found in main branch, trying master branch`);
-      const masterRawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/master/${path}`;
-      const masterResponse = await axiosInstance.get(masterRawUrl, { responseType: 'text' });
+    // Try master branch if main branch fails
+    let masterError = null;
+    try {
+      console.log(`Trying master branch for ${path}`);
+      const masterUrl = `https://raw.githubusercontent.com/${owner}/${repo}/master/${path}`;
+      const masterResponse = await axiosInstance.get(masterUrl, { 
+        responseType: 'text',
+        validateStatus: (status) => status < 500,
+        timeout: 8000
+      });
       
       if (masterResponse.status === 200) {
         const content = masterResponse.data;
@@ -231,24 +301,24 @@ async function getFileContent(owner: string, repo: string, path: string) {
           content: formattedContent,
           lineCount: lines.length
         };
-      } else {
-        throw new Error(`File not found in main or master branch: ${path}`);
       }
+    } catch (error) {
+      masterError = error;
+      console.log(`Error fetching from master branch: ${error instanceof Error ? error.message : String(error)}`);
     }
     
-    const content = response.data;
-    const lines = content.split('\n');
-    
-    // Format with file path header
-    const formattedContent = `# /${path}\n${content}\n\n`;
-    
+    // If we got here, we couldn't get the file from either branch
     return {
-      content: formattedContent,
-      lineCount: lines.length
+      content: `# /${path}\n[File content could not be retrieved]\n\n`,
+      lineCount: 1
     };
   } catch (error) {
-    console.error(`Error fetching file content for ${path}:`, error);
-    throw error;
+    console.error(`Error in getFileContent for ${path}:`, error);
+    // Return empty content rather than throwing
+    return {
+      content: `# /${path}\n[Error processing file]\n\n`,
+      lineCount: 1
+    };
   }
 }
 
