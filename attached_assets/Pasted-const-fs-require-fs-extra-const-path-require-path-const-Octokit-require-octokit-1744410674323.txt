@@ -1,0 +1,457 @@
+const fs = require('fs-extra');
+const path = require('path');
+const { Octokit } = require('octokit');
+const axios = require('axios');
+const simpleGit = require('simple-git');
+const readline = require('readline');
+const os = require('os');
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+
+// Create readline interface for user input
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout
+});
+
+// Initialize Octokit
+const octokit = new Octokit();
+
+// Initialize Express
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server);
+const PORT = process.env.PORT || 3000;
+
+// Serve static files
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json());
+
+// List of binary file extensions to skip
+const BINARY_EXTENSIONS = [
+  '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.webp', '.tiff', '.svg',
+  '.mp3', '.mp4', '.wav', '.avi', '.mov', '.wmv', '.flv', '.ogg',
+  '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+  '.zip', '.rar', '.7z', '.tar', '.gz', '.exe', '.dll', '.so', '.bin', 
+  '.dat', '.db', '.sqlite', '.class', '.jar', '.war', '.pyc', '.pyd'
+];
+
+// Function to check if a file is likely binary
+function isBinaryFile(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  return BINARY_EXTENSIONS.includes(ext);
+}
+
+// Function to validate GitHub URL
+function validateGitHubUrl(url) {
+  try {
+    const urlObj = new URL(url);
+    
+    // Check if it's a GitHub URL
+    if (!urlObj.hostname.includes('github.com')) {
+      throw new Error('Not a GitHub URL');
+    }
+    
+    // Extract owner and repo from the URL path
+    const pathSegments = urlObj.pathname.split('/').filter(segment => segment.length > 0);
+    
+    if (pathSegments.length < 2) {
+      throw new Error('Invalid GitHub repository URL format');
+    }
+    
+    return {
+      owner: pathSegments[0],
+      repo: pathSegments[1],
+      isValid: true
+    };
+  } catch (error) {
+    console.error(`Error validating URL: ${error.message}`);
+    return { isValid: false };
+  }
+}
+
+// Function to get the temporary directory path
+function getTempDir() {
+  return path.join(os.tmpdir(), `github-repo-extractor-${Date.now()}`);
+}
+
+// Function to clone repository using simple-git
+async function cloneRepository(url, targetDir, socket = null) {
+  try {
+    const message = `Cloning repository from ${url}...`;
+    if (socket) {
+      socket.emit('progress', { message });
+    } else {
+      console.log(message);
+    }
+    
+    await simpleGit().clone(url, targetDir, ['--depth=1']); // Using depth=1 for faster cloning
+    
+    const successMessage = `Repository cloned to ${targetDir}`;
+    if (socket) {
+      socket.emit('progress', { message: successMessage });
+    } else {
+      console.log(successMessage);
+    }
+    
+    return true;
+  } catch (error) {
+    const errorMessage = `Error cloning repository: ${error.message}`;
+    if (socket) {
+      socket.emit('progress', { message: errorMessage, error: true });
+    } else {
+      console.error(errorMessage);
+    }
+    return false;
+  }
+}
+
+// Function to process a single file
+async function processFile(filePath, basePath, socket = null) {
+  try {
+    const stats = await fs.stat(filePath);
+    
+    // Skip if it's a directory or not a regular file
+    if (!stats.isFile()) {
+      return '';
+    }
+    
+    // Skip .git files/directories
+    if (filePath.includes('.git')) {
+      return '';
+    }
+    
+    const relativePath = path.relative(basePath, filePath).replace(/\\/g, '/');
+    
+    // Skip binary files
+    if (isBinaryFile(filePath)) {
+      const message = `Skipping binary file: ${relativePath}`;
+      if (socket) {
+        socket.emit('progress', { message });
+      } else {
+        console.log(message);
+      }
+      return `\n\n${'='.repeat(80)}\n${relativePath} [BINARY FILE - CONTENT SKIPPED]\n${'='.repeat(80)}\n\n`;
+    }
+    
+    // Try to read the file content
+    try {
+      const content = await fs.readFile(filePath, 'utf8');
+      
+      // Create header with file path
+      const header = `\n\n${'='.repeat(80)}\n${relativePath}\n${'='.repeat(80)}\n\n`;
+      
+      return header + content;
+    } catch (error) {
+      const message = `Warning: Could not read file ${relativePath}: ${error.message}`;
+      if (socket) {
+        socket.emit('progress', { message, warning: true });
+      } else {
+        console.warn(message);
+      }
+      return `\n\n${'='.repeat(80)}\n${relativePath} [ERROR READING FILE: ${error.message}]\n${'='.repeat(80)}\n\n`;
+    }
+  } catch (error) {
+    const message = `Warning: Error processing file ${filePath}: ${error.message}`;
+    if (socket) {
+      socket.emit('progress', { message, warning: true });
+    } else {
+      console.warn(message);
+    }
+    return '';
+  }
+}
+
+// Function to count files in the repository (for progress tracking)
+async function countFiles(dirPath) {
+  let count = 0;
+  
+  async function countDir(currentPath) {
+    const entries = await fs.readdir(currentPath);
+    
+    for (const entry of entries) {
+      const fullPath = path.join(currentPath, entry);
+      
+      // Skip .git directory
+      if (entry === '.git') {
+        continue;
+      }
+      
+      const stats = await fs.stat(fullPath);
+      
+      if (stats.isDirectory()) {
+        await countDir(fullPath);
+      } else if (stats.isFile()) {
+        count++;
+      }
+    }
+  }
+  
+  await countDir(dirPath);
+  return count;
+}
+
+// Function to process all files in the repository
+async function processRepository(repoDir, socket = null) {
+  let result = '';
+  let processedFiles = 0;
+  
+  // Count total files for progress tracking
+  const totalFiles = await countFiles(repoDir);
+  
+  const initialMessage = `Found ${totalFiles} files to process`;
+  if (socket) {
+    socket.emit('progress', { 
+      message: initialMessage,
+      totalFiles 
+    });
+  } else {
+    console.log(initialMessage);
+  }
+  
+  // Recursive function to process directories
+  async function processDir(dirPath) {
+    const entries = await fs.readdir(dirPath);
+    
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry);
+      
+      // Skip .git directory
+      if (entry === '.git') {
+        continue;
+      }
+      
+      const stats = await fs.stat(fullPath);
+      
+      if (stats.isDirectory()) {
+        await processDir(fullPath);
+      } else if (stats.isFile()) {
+        result += await processFile(fullPath, repoDir, socket);
+        processedFiles++;
+        
+        // Show progress
+        if (processedFiles % 5 === 0 || processedFiles === totalFiles) {
+          const percent = Math.round((processedFiles / totalFiles) * 100);
+          const progressMessage = `Processing files... ${processedFiles}/${totalFiles} (${percent}%)`;
+          
+          if (socket) {
+            socket.emit('progress', { 
+              message: progressMessage,
+              current: processedFiles,
+              total: totalFiles,
+              percent
+            });
+          } else {
+            process.stdout.write(`\r${progressMessage}`);
+          }
+        }
+      }
+    }
+  }
+  
+  await processDir(repoDir);
+  const completeMessage = 'File processing complete!';
+  
+  if (socket) {
+    socket.emit('progress', { message: completeMessage, complete: true });
+  } else {
+    console.log('\n' + completeMessage);
+  }
+  
+  return result;
+}
+
+// Function to add repository metadata to the output
+async function addMetadata(url, urlInfo) {
+  const now = new Date().toISOString();
+  
+  return `${'#'.repeat(80)}
+# GITHUB REPOSITORY EXTRACTION
+# Repository: ${urlInfo.owner}/${urlInfo.repo}
+# Source URL: ${url}
+# Extracted on: ${now}
+${'#'.repeat(80)}\n\n`;
+}
+
+// Main function to extract the repository
+async function extractRepository(url, isWeb = false, socket = null, res = null) {
+  // Validate URL
+  const urlInfo = validateGitHubUrl(url);
+  if (!urlInfo.isValid) {
+    const errorMessage = 'Invalid GitHub repository URL. Please provide a valid URL.';
+    if (isWeb) {
+      if (socket) socket.emit('progress', { message: errorMessage, error: true });
+      if (res) res.status(400).json({ error: errorMessage });
+      return null;
+    } else {
+      console.error(errorMessage);
+      process.exit(1);
+    }
+  }
+  
+  // Create temporary directory
+  const tempDir = getTempDir();
+  await fs.ensureDir(tempDir);
+  
+  try {
+    // Clone the repository
+    const cloneSuccess = await cloneRepository(url, tempDir, socket);
+    if (!cloneSuccess) {
+      const errorMessage = 'Failed to clone the repository. Please check the URL and try again.';
+      await fs.remove(tempDir);
+      
+      if (isWeb) {
+        if (socket) socket.emit('progress', { message: errorMessage, error: true });
+        if (res) res.status(400).json({ error: errorMessage });
+        return null;
+      } else {
+        console.error(errorMessage);
+        process.exit(1);
+      }
+    }
+    
+    // Process the repository files
+    const processMessage = 'Processing files...';
+    if (socket) {
+      socket.emit('progress', { message: processMessage });
+    } else {
+      console.log(processMessage);
+    }
+    
+    // Add metadata header
+    let extractedContent = await addMetadata(url, urlInfo);
+    
+    // Process all files
+    extractedContent += await processRepository(tempDir, socket);
+    
+    // Generate output file name
+    const outputFileName = `${urlInfo.owner}-${urlInfo.repo}-extracted.txt`;
+    const outputPath = path.join(process.cwd(), 'public', 'downloads', outputFileName);
+    
+    // Ensure downloads directory exists
+    await fs.ensureDir(path.join(process.cwd(), 'public', 'downloads'));
+    
+    // Write to output file
+    await fs.writeFile(outputPath, extractedContent);
+    
+    const completeMessage = `Repository extraction completed!`;
+    if (socket) {
+      socket.emit('progress', { 
+        message: completeMessage,
+        fileName: outputFileName,
+        downloadReady: true,
+        owner: urlInfo.owner,
+        repo: urlInfo.repo
+      });
+    } else {
+      console.log(`\n${completeMessage}`);
+      console.log(`Output file: ${outputPath}`);
+    }
+    
+    // Clean up
+    await fs.remove(tempDir);
+    
+    if (isWeb && res) {
+      res.json({ 
+        success: true, 
+        fileName: outputFileName,
+        owner: urlInfo.owner,
+        repo: urlInfo.repo
+      });
+    }
+    
+    return outputFileName;
+    
+  } catch (error) {
+    const errorMessage = `Error: ${error.message}`;
+    
+    // Clean up on error
+    try {
+      await fs.remove(tempDir);
+    } catch (cleanupError) {
+      const cleanupErrorMsg = `Error during cleanup: ${cleanupError.message}`;
+      if (socket) {
+        socket.emit('progress', { message: cleanupErrorMsg, error: true });
+      } else {
+        console.error(cleanupErrorMsg);
+      }
+    }
+    
+    if (isWeb) {
+      if (socket) socket.emit('progress', { message: errorMessage, error: true });
+      if (res) res.status(500).json({ error: errorMessage });
+      return null;
+    } else {
+      console.error(errorMessage);
+      process.exit(1);
+    }
+  }
+}
+
+// API Routes
+app.post('/api/extract', (req, res) => {
+  const { url } = req.body;
+  if (!url) {
+    return res.status(400).json({ error: 'Repository URL is required' });
+  }
+  // Processing happens asynchronously, results sent via socket
+  extractRepository(url, true, null, res);
+});
+
+app.get('/api/download/:fileName', (req, res) => {
+  const fileName = req.params.fileName;
+  const filePath = path.join(process.cwd(), 'public', 'downloads', fileName);
+  
+  if (fs.existsSync(filePath)) {
+    res.download(filePath);
+  } else {
+    res.status(404).json({ error: 'File not found' });
+  }
+});
+
+// Socket connection
+io.on('connection', (socket) => {
+  console.log('Client connected');
+  
+  socket.on('extract', async (data) => {
+    if (!data || !data.url) {
+      socket.emit('progress', { message: 'No repository URL provided', error: true });
+      return;
+    }
+    
+    await extractRepository(data.url, true, socket);
+  });
+  
+  socket.on('disconnect', () => {
+    console.log('Client disconnected');
+  });
+});
+
+// Start the web server if run directly
+if (require.main === module) {
+  // Check if command-line arguments are provided
+  const args = process.argv.slice(2);
+  
+  if (args.length > 0 && args[0] === '--web') {
+    // Start in web mode
+    server.listen(PORT, () => {
+      console.log(`GitHub Repository Extractor web server running at http://localhost:${PORT}`);
+    });
+  } else {
+    // Start in command-line mode
+    console.log('GitHub Repository Extractor');
+    console.log('==========================\n');
+    
+    rl.question('Enter GitHub repository URL: ', async (url) => {
+      await extractRepository(url.trim());
+      rl.close();
+    });
+  }
+} else {
+  // Export for use as a module
+  module.exports = {
+    extractRepository,
+    validateGitHubUrl
+  };
+}

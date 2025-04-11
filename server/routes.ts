@@ -5,303 +5,232 @@ import { insertRepositoryLogSchema, gitHubUrlSchema } from "@shared/schema";
 import { z } from "zod";
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+import * as fs from 'fs-extra';
+import * as path from 'path';
+import * as os from 'os';
+import simpleGit from 'simple-git';
+import { Server as SocketServer } from 'socket.io';
 
-// Define user agent to avoid being blocked
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
+// List of binary file extensions to skip
+const BINARY_EXTENSIONS = [
+  '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.webp', '.tiff', '.svg',
+  '.mp3', '.mp4', '.wav', '.avi', '.mov', '.wmv', '.flv', '.ogg',
+  '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+  '.zip', '.rar', '.7z', '.tar', '.gz', '.exe', '.dll', '.so', '.bin', 
+  '.dat', '.db', '.sqlite', '.class', '.jar', '.war', '.pyc', '.pyd',
+  '.woff', '.woff2', '.ttf', '.eot'
+];
 
-// Configure axios with headers
-const axiosInstance = axios.create({
-  headers: {
-    'User-Agent': USER_AGENT,
-    'Accept': 'text/html,application/xhtml+xml,application/xml',
-  },
-  timeout: 60000,  // 60 seconds timeout
-});
-
-// Function to check if a file is binary based on extension
-function isBinaryFile(filename: string): boolean {
-  const binaryExtensions = [
-    // Images
-    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg',
-    // Documents
-    '.pdf', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx',
-    // Archives
-    '.zip', '.rar', '.tar', '.gz', '.7z',
-    // Audio/Video
-    '.mp3', '.mp4', '.wav', '.avi', '.mov', '.flv',
-    // Executables
-    '.exe', '.dll', '.so', '.dylib',
-    // Others
-    '.bin', '.dat', '.woff', '.woff2', '.ttf', '.eot'
-  ];
-  
-  const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase();
-  return binaryExtensions.includes(ext);
+// Function to check if a file is likely binary
+function isBinaryFile(filePath: string): boolean {
+  const ext = path.extname(filePath).toLowerCase();
+  return BINARY_EXTENSIONS.includes(ext);
 }
 
-// Function to retrieve file content from GitHub
-async function getFileContent(owner: string, repo: string, path: string, branch: string) {
+// Function to get a unique temporary directory
+function getTempDir(): string {
+  return path.join(os.tmpdir(), `github-repo-extractor-${Date.now()}`);
+}
+
+// Function to add metadata header to the output
+function addMetadata(url: string, owner: string, repo: string): string {
+  const now = new Date().toISOString();
+  
+  return `${'#'.repeat(80)}
+# GITHUB REPOSITORY EXTRACTION
+# Repository: ${owner}/${repo}
+# Source URL: ${url}
+# Extracted on: ${now}
+${'#'.repeat(80)}\n\n`;
+}
+
+// Function to clone a repository using simple-git
+async function cloneRepository(url: string, targetDir: string): Promise<boolean> {
   try {
-    // All branches to try if specified branch fails
-    const branchesToTry = [branch, 'main', 'master', 'develop'];
+    console.log(`Cloning repository from ${url}...`);
     
-    for (const currentBranch of branchesToTry) {
-      try {
-        const url = `https://raw.githubusercontent.com/${owner}/${repo}/${currentBranch}/${path}`;
-        console.log(`Fetching file content from: ${url}`);
-        
-        const response = await axiosInstance.get(url, { 
-          responseType: 'text',
-          validateStatus: (status) => status < 500, // Accept 404s
-          timeout: 10000 // 10 second timeout
-        });
-        
-        if (response.status === 200) {
-          const content = response.data;
-          
-          // Skip binary data
-          if (typeof content !== 'string') {
-            console.log(`Skipping binary content for ${path}`);
-            return {
-              content: `# /${path}\n[Binary file - content not displayed]\n\n`,
-              lineCount: 1
-            };
-          }
-          
-          const lines = content.split('\n');
-          
-          // Format with file path header
-          const formattedContent = `# /${path}\n${content}\n\n`;
-          
-          return {
-            content: formattedContent,
-            lineCount: lines.length
-          };
-        }
-      } catch (error) {
-        console.log(`Error fetching from ${currentBranch} branch: ${error instanceof Error ? error.message : String(error)}`);
-        // Continue to next branch
-      }
-    }
+    await simpleGit().clone(url, targetDir, ['--depth=1']); // Shallow clone for speed
     
-    // If we got here, we couldn't get the file from any branch
-    return {
-      content: `# /${path}\n[File content could not be retrieved]\n\n`,
-      lineCount: 1
-    };
+    console.log(`Repository cloned successfully to ${targetDir}`);
+    return true;
   } catch (error) {
-    console.error(`Error in getFileContent for ${path}:`, error);
-    return {
-      content: `# /${path}\n[Error processing file]\n\n`,
-      lineCount: 1
-    };
+    console.error(`Error cloning repository: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
   }
 }
 
-// Function to recursively get repository content
-async function getRepositoryContent(owner: string, repo: string): Promise<{content: string, fileCount: number, lineCount: number}> {
+// Function to process a single file
+async function processFile(filePath: string, basePath: string): Promise<{content: string, lineCount: number}> {
   try {
-    let allContent = '';
-    let fileCount = 0;
-    let lineCount = 0;
+    const stats = await fs.stat(filePath);
     
-    // Determine default branch
-    let defaultBranch = 'main';
+    // Skip if it's not a regular file
+    if (!stats.isFile()) {
+      return { content: '', lineCount: 0 };
+    }
+    
+    // Skip .git files/directories
+    if (filePath.includes('.git')) {
+      return { content: '', lineCount: 0 };
+    }
+    
+    // Get relative path for the file
+    const relativePath = path.relative(basePath, filePath).replace(/\\/g, '/');
+    
+    // Skip binary files
+    if (isBinaryFile(filePath)) {
+      console.log(`Skipping binary file: ${relativePath}`);
+      return { 
+        content: `\n\n${'='.repeat(80)}\n${relativePath} [BINARY FILE - CONTENT SKIPPED]\n${'='.repeat(80)}\n\n`,
+        lineCount: 1 
+      };
+    }
+    
+    // Read file content
     try {
-      const repoUrl = `https://github.com/${owner}/${repo}`;
-      const response = await axiosInstance.get(repoUrl);
-      if (response.data.includes('tree/master')) {
-        defaultBranch = 'master';
-      }
-      console.log(`Using ${defaultBranch} as default branch`);
+      const content = await fs.readFile(filePath, 'utf8');
+      const lines = content.split('\n');
+      
+      // Create header with file path
+      const header = `\n\n${'='.repeat(80)}\n${relativePath}\n${'='.repeat(80)}\n\n`;
+      
+      return { 
+        content: header + content,
+        lineCount: lines.length
+      };
     } catch (error) {
-      console.log(`Failed to detect default branch, using "${defaultBranch}"`);
+      console.warn(`Could not read file ${relativePath}: ${error instanceof Error ? error.message : String(error)}`);
+      return { 
+        content: `\n\n${'='.repeat(80)}\n${relativePath} [ERROR READING FILE]\n${'='.repeat(80)}\n\n`,
+        lineCount: 1
+      };
     }
-    
-    // Get all files in repository
-    const allFiles: string[] = [];
-    
-    // Try GitHub API first (for both main and master branches)
-    for (const branch of ['main', 'master']) {
-      try {
-        console.log(`Trying GitHub API with branch: ${branch}`);
-        const apiUrl = `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
-        const response = await axiosInstance.get(apiUrl, {
-          headers: { 'Accept': 'application/vnd.github.v3+json' },
-          timeout: 20000
-        });
-        
-        if (response.status === 200 && response.data?.tree) {
-          console.log(`Successfully got tree from GitHub API using ${branch} branch`);
-          response.data.tree.forEach((item: any) => {
-            if (item.type === 'blob' && item.path && !isBinaryFile(item.path)) {
-              allFiles.push(item.path);
-            }
-          });
-          
-          if (allFiles.length > 0) {
-            console.log(`Found ${allFiles.length} files via GitHub API`);
-            break; // Successfully got files, exit loop
-          }
-        }
-      } catch (error) {
-        console.error(`Error using GitHub API with branch ${branch}:`, error);
-      }
-    }
-    
-    // If GitHub API failed, use web scraping approach
-    if (allFiles.length === 0) {
-      console.log('GitHub API failed, using web scraping approach');
-      try {
-        // Get repository structure using web scraping
-        await scrapeRepositoryStructure(owner, repo, defaultBranch, allFiles);
-        console.log(`Found ${allFiles.length} files via web scraping`);
-      } catch (error) {
-        console.error('Error during web scraping:', error);
-      }
-    }
-    
-    // If we still have no files, try some common files directly
-    if (allFiles.length === 0) {
-      console.log('Trying common files as last resort');
-      const commonFiles = ['README.md', 'package.json', 'LICENSE', '.gitignore'];
-      for (const file of commonFiles) {
-        try {
-          const url = `https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${file}`;
-          const response = await axiosInstance.head(url);
-          if (response.status === 200) {
-            allFiles.push(file);
-          }
-        } catch (error) {
-          // Skip this file
-        }
-      }
-    }
-    
-    // Process all files (no limits)
-    console.log(`Processing all ${allFiles.length} files (no limits)`);
-    
-    for (const filePath of allFiles) {
-      try {
-        // Skip binary files
-        if (isBinaryFile(filePath)) {
-          console.log(`Skipping binary file: ${filePath}`);
-          continue;
-        }
-        
-        // Get file content
-        const result = await getFileContent(owner, repo, filePath, defaultBranch);
-        
-        // Add content to total
-        allContent += result.content;
-        fileCount++;
-        lineCount += result.lineCount;
-        
-        console.log(`Added file: ${filePath} (${result.lineCount} lines)`);
-      } catch (error) {
-        console.error(`Error processing ${filePath}:`, error);
-      }
-    }
-    
-    // If we didn't get any content, return error message
-    if (allContent === '') {
-      allContent = `# Repository: ${owner}/${repo}\n\nNo valid text files could be found in this repository.`;
-      lineCount = 3;
-    }
-    
-    console.log(`Finished processing. Total files: ${fileCount}, Total lines: ${lineCount}`);
-    
-    return {
-      content: allContent,
-      fileCount,
-      lineCount
-    };
   } catch (error) {
-    console.error('Error processing repository:', error);
-    return {
-      content: `# Error\n\nFailed to process repository ${owner}/${repo}: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      fileCount: 0,
-      lineCount: 3
-    };
+    console.warn(`Error processing file ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    return { content: '', lineCount: 0 };
   }
 }
 
-// Recursive function to scrape repository structure
-async function scrapeRepositoryStructure(
-  owner: string, 
-  repo: string, 
-  branch: string, 
-  files: string[], 
-  path: string = '', 
-  visited = new Set<string>(), 
-  depth = 0
-): Promise<void> {
-  // Limit recursion depth to prevent infinite loops
-  if (depth > 20) return;
+// Function to count files in the repository (for progress tracking)
+async function countFiles(dirPath: string): Promise<number> {
+  let count = 0;
   
-  // Avoid visiting the same directory twice
-  const dirKey = `${path}`;
-  if (visited.has(dirKey)) return;
-  visited.add(dirKey);
-  
-  try {
-    // Construct directory URL
-    const dirUrl = path 
-      ? `https://github.com/${owner}/${repo}/tree/${branch}/${path}`
-      : `https://github.com/${owner}/${repo}/tree/${branch}`;
+  async function countDir(currentPath: string) {
+    const entries = await fs.readdir(currentPath);
     
-    console.log(`Scraping directory: ${path || 'root'}`);
-    
-    // Fetch directory page
-    const response = await axiosInstance.get(dirUrl);
-    const $ = cheerio.load(response.data);
-    
-    // Find file and directory links
-    const dirItems: {path: string, isDir: boolean}[] = [];
-    
-    // Modern GitHub interface: find rows with role="row"
-    $('a[role="row"]').each((_, el) => {
-      const href = $(el).attr('href');
-      if (!href) return;
+    for (const entry of entries) {
+      const fullPath = path.join(currentPath, entry);
       
-      // Determine if file or directory
-      const isDir = href.includes(`/tree/${branch}/`);
-      const isFile = href.includes(`/blob/${branch}/`);
-      
-      let itemPath = '';
-      if (isFile) {
-        // Extract file path
-        const match = href.match(new RegExp(`/${owner}/${repo}/blob/${branch}/(.+)$`));
-        if (match && match[1]) {
-          itemPath = match[1];
-        }
-      } else if (isDir) {
-        // Extract directory path
-        const match = href.match(new RegExp(`/${owner}/${repo}/tree/${branch}/(.+)$`));
-        if (match && match[1]) {
-          itemPath = match[1];
-        }
+      // Skip .git directory
+      if (entry === '.git') {
+        continue;
       }
       
-      if (itemPath) {
-        dirItems.push({path: itemPath, isDir});
+      const stats = await fs.stat(fullPath);
+      
+      if (stats.isDirectory()) {
+        await countDir(fullPath);
+      } else if (stats.isFile()) {
+        count++;
       }
-    });
+    }
+  }
+  
+  await countDir(dirPath);
+  return count;
+}
+
+// Function to process all files in the repository
+async function processRepository(repoDir: string): Promise<{content: string, fileCount: number, lineCount: number}> {
+  let result = '';
+  let processedFiles = 0;
+  let totalLines = 0;
+  
+  // Count total files for progress tracking
+  const totalFiles = await countFiles(repoDir);
+  console.log(`Found ${totalFiles} files to process`);
+  
+  // Recursive function to process directories
+  async function processDir(dirPath: string) {
+    const entries = await fs.readdir(dirPath);
     
-    // Process all files and directories
-    for (const item of dirItems) {
-      if (item.isDir) {
-        // Process subdirectory
-        await scrapeRepositoryStructure(owner, repo, branch, files, item.path, visited, depth + 1);
-      } else {
-        // Add file to list if not binary
-        if (!isBinaryFile(item.path) && !files.includes(item.path)) {
-          files.push(item.path);
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry);
+      
+      // Skip .git directory
+      if (entry === '.git') {
+        continue;
+      }
+      
+      const stats = await fs.stat(fullPath);
+      
+      if (stats.isDirectory()) {
+        await processDir(fullPath);
+      } else if (stats.isFile()) {
+        const { content, lineCount } = await processFile(fullPath, repoDir);
+        result += content;
+        totalLines += lineCount;
+        
+        if (content) {
+          processedFiles++;
+        }
+        
+        // Log progress
+        if (processedFiles % 5 === 0 || processedFiles === totalFiles) {
+          const percent = Math.round((processedFiles / totalFiles) * 100);
+          console.log(`Processing files... ${processedFiles}/${totalFiles} (${percent}%)`);
         }
       }
     }
+  }
+  
+  await processDir(repoDir);
+  console.log('File processing complete!');
+  
+  return {
+    content: result,
+    fileCount: processedFiles,
+    lineCount: totalLines
+  };
+}
+
+// Main function to extract repository content
+async function extractRepository(url: string, owner: string, repo: string): Promise<{content: string, fileCount: number, lineCount: number}> {
+  // Create temporary directory
+  const tempDir = getTempDir();
+  await fs.ensureDir(tempDir);
+  
+  try {
+    // Clone the repository
+    const cloneSuccess = await cloneRepository(url, tempDir);
+    if (!cloneSuccess) {
+      throw new Error('Failed to clone repository');
+    }
+    
+    // Add metadata header
+    let extractedContent = addMetadata(url, owner, repo);
+    
+    // Process all repository files
+    const result = await processRepository(tempDir);
+    extractedContent += result.content;
+    
+    // Clean up
+    await fs.remove(tempDir);
+    
+    return {
+      content: extractedContent,
+      fileCount: result.fileCount,
+      lineCount: result.lineCount
+    };
   } catch (error) {
-    console.error(`Error scraping directory ${path}:`, error);
+    // Clean up on error
+    try {
+      await fs.remove(tempDir);
+    } catch (cleanupError) {
+      console.error(`Error during cleanup: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+    }
+    
+    throw error;
   }
 }
 
@@ -322,8 +251,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ message: "Invalid repository URL format" });
       }
       
-      // Process repository
-      const result = await getRepositoryContent(owner, repo);
+      // Process repository using Git clone approach
+      console.log(`Starting extraction of ${owner}/${repo} using Git clone approach`);
+      const result = await extractRepository(validatedUrl, owner, repo);
       
       // Log processing
       await storage.logRepositoryProcessing({
