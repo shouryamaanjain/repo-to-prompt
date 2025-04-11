@@ -5,10 +5,12 @@ import { insertRepositoryLogSchema, gitHubUrlSchema } from "@shared/schema";
 import { Octokit } from "@octokit/rest";
 import { z } from "zod";
 
-// Initialize Octokit
-const octokit = new Octokit({
-  auth: process.env.GITHUB_TOKEN || undefined,
-});
+// Function to create an Octokit instance with optional token
+function createOctokit(token?: string) {
+  return new Octokit({
+    auth: token || process.env.GITHUB_TOKEN || undefined,
+  });
+}
 
 export async function registerRoutes(app: Express): Promise<Server> {
   // Route to process repository
@@ -27,7 +29,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
       
       // Get repository content recursively
-      const result = await getRepositoryContent(owner, repo);
+      const token = req.body.token;
+      const result = await getRepositoryContent(owner, repo, '', token);
       
       // Log the processing
       await storage.logRepositoryProcessing({
@@ -86,8 +89,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
 }
 
 // Function to get repository content recursively
-async function getRepositoryContent(owner: string, repo: string, path: string = '') {
+async function getRepositoryContent(owner: string, repo: string, path: string = '', token?: string) {
   try {
+    const octokit = createOctokit(token);
     const { data } = await octokit.repos.getContent({
       owner,
       repo,
@@ -110,7 +114,7 @@ async function getRepositoryContent(owner: string, repo: string, path: string = 
 
           try {
             // Get file content
-            const fileResult = await getFileContent(owner, repo, item.path);
+            const fileResult = await getFileContent(owner, repo, item.path, token);
             if (fileResult.content) {
               allContent += fileResult.content;
               fileCount++;
@@ -122,7 +126,7 @@ async function getRepositoryContent(owner: string, repo: string, path: string = 
           }
         } else if (item.type === 'dir') {
           // Recursively get directory content
-          const dirResult = await getRepositoryContent(owner, repo, item.path);
+          const dirResult = await getRepositoryContent(owner, repo, item.path, token);
           allContent += dirResult.content;
           fileCount += dirResult.fileCount;
           lineCount += dirResult.lineCount;
@@ -142,8 +146,9 @@ async function getRepositoryContent(owner: string, repo: string, path: string = 
 }
 
 // Function to get file content
-async function getFileContent(owner: string, repo: string, path: string) {
+async function getFileContent(owner: string, repo: string, path: string, token?: string) {
   try {
+    const octokit = createOctokit(token);
     const { data } = await octokit.repos.getContent({
       owner,
       repo,

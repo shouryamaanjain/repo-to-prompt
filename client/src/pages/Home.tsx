@@ -46,8 +46,8 @@ const Home: React.FC = () => {
   const { toast } = useToast();
 
   const processMutation = useMutation({
-    mutationFn: async (url: string) => {
-      const response = await apiRequest('POST', '/api/process-repository', { url });
+    mutationFn: async ({ url, token }: { url: string; token?: string }) => {
+      const response = await apiRequest('POST', '/api/process-repository', { url, token });
       return response.json();
     },
     onMutate: () => {
@@ -107,8 +107,8 @@ const Home: React.FC = () => {
     );
   };
 
-  const handleSubmit = (url: string) => {
-    processMutation.mutate(url);
+  const handleSubmit = (url: string, token?: string) => {
+    processMutation.mutate({ url, token });
   };
 
   return (
