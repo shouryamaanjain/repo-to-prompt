@@ -5,7 +5,7 @@ import { insertRepositoryLogSchema, gitHubUrlSchema } from "@shared/schema";
 import { z } from "zod";
 import axios from 'axios';
 import * as cheerio from 'cheerio';
-import * as fs from 'fs-extra';
+import fs from 'fs-extra';
 import * as path from 'path';
 import * as os from 'os';
 import simpleGit from 'simple-git';
