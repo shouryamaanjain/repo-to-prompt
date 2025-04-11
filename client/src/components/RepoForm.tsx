@@ -5,20 +5,18 @@ import { z } from 'zod';
 import { gitHubUrlSchema } from '@shared/schema';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form';
-import { Loader2, Info } from 'lucide-react';
+import { Form, FormControl, FormField, FormItem, FormMessage } from '@/components/ui/form';
+import { Loader2 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 
 interface RepoFormProps {
-  onSubmit: (url: string, token?: string) => void;
+  onSubmit: (url: string) => void;
   isLoading: boolean;
 }
 
 // Define form schema
 const formSchema = z.object({
   url: gitHubUrlSchema,
-  token: z.string().optional(),
 });
 
 type FormValues = z.infer<typeof formSchema>;
@@ -28,12 +26,11 @@ const RepoForm: React.FC<RepoFormProps> = ({ onSubmit, isLoading }) => {
     resolver: zodResolver(formSchema),
     defaultValues: {
       url: '',
-      token: '',
     },
   });
 
   const handleSubmit = (values: FormValues) => {
-    onSubmit(values.url, values.token);
+    onSubmit(values.url);
   };
 
   const loadSampleRepo = () => {
@@ -46,7 +43,7 @@ const RepoForm: React.FC<RepoFormProps> = ({ onSubmit, isLoading }) => {
       <CardHeader>
         <CardTitle className="text-lg font-semibold">Enter GitHub Repository URL</CardTitle>
         <CardDescription>
-          Processing large repositories may require a GitHub token to avoid rate limits
+          Convert any GitHub repository into a single text file
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -72,46 +69,6 @@ const RepoForm: React.FC<RepoFormProps> = ({ onSubmit, isLoading }) => {
                   </div>
                   <FormMessage />
                   <p className="mt-1 text-sm text-gray-500">Example: https://github.com/facebook/react</p>
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="token"
-              render={({ field }) => (
-                <FormItem>
-                  <div className="flex items-center gap-2">
-                    <FormLabel className="text-sm font-medium">
-                      GitHub Personal Access Token
-                    </FormLabel>
-                    <TooltipProvider>
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Info className="h-4 w-4 text-[#0969DA] cursor-help" />
-                        </TooltipTrigger>
-                        <TooltipContent>
-                          <p className="max-w-xs text-xs">
-                            GitHub limits API requests for unauthenticated users. Adding a token increases your rate limit.
-                            <br/><br/>
-                            You can create a token at <b>GitHub → Settings → Developer settings → Personal access tokens</b>.
-                            <br/><br/>
-                            Only public repo access is needed.
-                          </p>
-                        </TooltipContent>
-                      </Tooltip>
-                    </TooltipProvider>
-                  </div>
-                  <FormControl>
-                    <Input
-                      {...field}
-                      type="password"
-                      placeholder="Optional: ghp_your_github_token"
-                      className="w-full border-[#D0D7DE] focus:ring-[#0969DA] focus:border-[#0969DA]"
-                      disabled={isLoading}
-                    />
-                  </FormControl>
-                  <FormMessage />
                 </FormItem>
               )}
             />
