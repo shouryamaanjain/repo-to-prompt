@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { storage } from '../server/storage';
+import { storage } from './_shared/storage.js';
 
 // Serverless function handler for getting repository processing logs
 export default async function handler(req: VercelRequest, res: VercelResponse) {

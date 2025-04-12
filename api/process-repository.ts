@@ -1,6 +1,6 @@
 import express from 'express';
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { gitHubUrlSchema } from '../shared/schema';
+import { gitHubUrlSchema } from './_shared/schema.js';
 import { z } from 'zod';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
@@ -8,7 +8,7 @@ import fs from 'fs-extra';
 import * as path from 'path';
 import * as os from 'os';
 import simpleGit from 'simple-git';
-import { storage } from '../server/storage';
+import { storage } from './_shared/storage.js';
 
 // List of binary file extensions to skip
 const BINARY_EXTENSIONS = [
