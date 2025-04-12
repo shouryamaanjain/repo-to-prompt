@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "routes": [
+    {
+      "src": "/api/process-repository",
+      "dest": "/api/process-repository.js"
+    },
+    {
+      "src": "/api/logs",
+      "dest": "/api/logs.js"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/"
+    }
+  ]
+}
